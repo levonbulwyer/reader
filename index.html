@@ -138,7 +138,7 @@ button{font:inherit;color:inherit}
 
 /* ---------- Text options popover ---------- */
 .aa-wrap{position:relative}
-.popover{position:absolute;right:0;top:calc(100% + 8px);width:290px;max-width:calc(100vw - 24px);padding:12px;background:var(--card);color:var(--fg);border-radius:12px;box-shadow:var(--pop-shadow);z-index:20}
+.popover{position:absolute;right:0;top:calc(100% + 8px);width:290px;max-height:calc(100vh - 90px);max-height:calc(100dvh - 90px);overflow-y:auto;max-width:calc(100vw - 24px);padding:12px;background:var(--card);color:var(--fg);border-radius:12px;box-shadow:var(--pop-shadow);z-index:20}
 .pop-sec + .pop-sec{margin-top:12px;padding-top:10px;border-top:1px solid var(--line)}
 .pop-label{font-size:11px;font-weight:600;color:var(--fg2);margin-bottom:6px}
 .font-list{display:flex;flex-direction:column}
@@ -293,13 +293,13 @@ const FONTS = {
   book:     { label: "Book’s own", stack: null }
 };
 const LH = { compact: 1.45, normal: 1.65, relaxed: 1.95 };
-const DEFAULTS = { font: 'serif', size: 110, spacing: 'normal', theme: 'auto' };
+const DEFAULTS = { font: 'serif', size: 110, spacing: 'normal', theme: 'auto', hl: 'on' };
 
 const state = {
   settings: { ...DEFAULTS },
   metas: [], cur: null, book: null, rendition: null,
   toc: [], rowEls: [], lastIdx: -1, curIdx: -1, spineIndex: 0, spineTotal: 0,
-  visited: new Set(), token: 0, saveTimer: null
+  visited: new Set(), token: 0, saveTimer: null, curFile: null, hlCfi: null
 };
 try {
   const saved = JSON.parse(lsGet('epubreader.settings') || '{}');
@@ -307,6 +307,7 @@ try {
   if (!FONTS[state.settings.font]) state.settings.font = DEFAULTS.font;
   if (!LH[state.settings.spacing]) state.settings.spacing = DEFAULTS.spacing;
   if (!['auto', 'light', 'dark'].includes(state.settings.theme)) state.settings.theme = 'auto';
+  if (!['on', 'off'].includes(state.settings.hl)) state.settings.hl = 'on';
   state.settings.size = Math.min(220, Math.max(70, +state.settings.size || DEFAULTS.size));
 } catch {}
 
@@ -329,7 +330,9 @@ body{background:${bg} !important;color:${fg} !important;font-size:${s.size}% !im
 p,li,dd,dt,blockquote,td,th{font-size:1em !important;line-height:${lh} !important}
 a,a:visited{color:${link} !important}
 img,video{max-width:100% !important;height:auto !important}
-::selection{background:rgba(10,122,255,.3)}`;
+::selection{background:rgba(10,122,255,.3)}
+::highlight(sentence-hl){background-color:${dark ? 'rgba(255,214,10,.32)' : 'rgba(255,204,0,.45)'}}
+body{-webkit-tap-highlight-color:transparent}`;
   if (f.stack) css += `\nbody,body *:not(code):not(pre):not(kbd):not(samp){font-family:${f.stack} !important}`;
   if (s.font === 'dyslexic') css += `\nbody{letter-spacing:.03em;word-spacing:.1em}\nbody,p,li,blockquote,div{text-align:left !important}`;
   if (dark) css += `\nbody *:not(a):not(img):not(svg):not(svg *){color:inherit !important;background-color:transparent !important}\nimg{opacity:.92}`;
@@ -353,9 +356,138 @@ function wireLinks(contents) {
     }, true);
   } catch {}
 }
+/* ------------------------------------------------------------------ tap a sentence to highlight it */
+const ABBR = /(?:^|[\s(\["'“‘])(?:Mr|Mrs|Ms|Dr|Prof|Sr|Jr|St|Mt|vs|cf|Fig|Figs|pp?|vols?|chs?|eds?|trans|Rev|Gen|Col|Capt|Lt|Sgt|Gov|Sen|Rep|Hon|Inc|Ltd|Co|approx|ca|viz|ibid|[B-HJ-Z])\.$/;
+const inlineish = (el, win) => { const d = win.getComputedStyle(el).display; return d === 'inline' || d === 'contents' || d.startsWith('inline-') || d.startsWith('ruby'); };
+function blockOf(node, win) {
+  let el = node.parentElement; const body = node.ownerDocument.body;
+  while (el && el !== body && inlineish(el, win)) el = el.parentElement;
+  return el || body;
+}
+function collectText(block, win) {
+  const walker = block.ownerDocument.createTreeWalker(block, 4);
+  const segs = []; let text = '';
+  while (walker.nextNode()) {
+    const n = walker.currentNode, p = n.parentElement;
+    if (!p || p.tagName === 'SCRIPT' || p.tagName === 'STYLE' || blockOf(n, win) !== block) continue;
+    segs.push({ node: n, start: text.length }); text += n.data;
+  }
+  return { segs, text };
+}
+function sentenceSpans(text, lang) {
+  let spans = [];
+  if (!/^[A-Za-z]{2,3}(-[A-Za-z0-9]+)*$/.test(lang || '')) lang = 'en';
+  try {
+    if (typeof Intl !== 'undefined' && Intl.Segmenter) {
+      let seg;
+      try { seg = new Intl.Segmenter(lang + '-u-ss-standard', { granularity: 'sentence' }); }
+      catch { seg = new Intl.Segmenter(lang, { granularity: 'sentence' }); }
+      for (const x of seg.segment(text)) spans.push([x.index, x.index + x.segment.length]);
+    }
+  } catch { spans = []; }
+  if (!spans.length) {
+    const re = /[^.!?…]*(?:[.!?…]+["'”’)\]]*(?=\s|$)|$)/g; let m;
+    while ((m = re.exec(text)) && m[0] !== '') { spans.push([m.index, m.index + m[0].length]); if (re.lastIndex >= text.length) break; }
+  }
+  const out = [];
+  for (const sp of spans) {
+    const last = out[out.length - 1];
+    const prev = last ? text.slice(last[0], last[1]).trimEnd() : '';
+    const joinsOn = last && (ABBR.test(prev) || (/[?!\u2026]["'\u201D\u2019)\]]*$/.test(prev) && /^\s*\p{Ll}/u.test(text.slice(sp[0], sp[1]))));
+    if (joinsOn) last[1] = sp[1]; else out.push([sp[0], sp[1]]);
+  }
+  return out;
+}
+function caretAt(doc, x, y) {
+  if (doc.caretRangeFromPoint) { const r = doc.caretRangeFromPoint(x, y); return r ? { node: r.startContainer, offset: r.startOffset } : null; }
+  if (doc.caretPositionFromPoint) { const p = doc.caretPositionFromPoint(x, y); return p ? { node: p.offsetNode, offset: p.offset } : null; }
+  return null;
+}
+function hitsText(doc, node, offset, x, y) {
+  const r = doc.createRange(), len = node.data.length;
+  const test = (a, b) => {
+    r.setStart(node, a); r.setEnd(node, b);
+    for (const q of r.getClientRects()) {
+      const pad = q.height * 0.45;
+      if (x >= q.left - 4 && x <= q.right + 4 && y >= q.top - pad && y <= q.bottom + pad) return true;
+    }
+    return false;
+  };
+  return (offset < len && test(offset, offset + 1)) || (offset > 0 && test(offset - 1, offset));
+}
+function sentenceRange(contents, node, offset) {
+  const doc = contents.document, win = contents.window;
+  const { segs, text } = collectText(blockOf(node, win), win);
+  const hit = segs.find(s => s.node === node);
+  if (!hit) return null;
+  const pos = hit.start + offset;
+  const spans = sentenceSpans(text, doc.documentElement.getAttribute('lang') || doc.documentElement.getAttribute('xml:lang'));
+  const sp = spans.find(x => pos >= x[0] && pos < x[1]) || spans[spans.length - 1];
+  if (!sp) return null;
+  let [a, b] = sp;
+  while (a < b && /\s/.test(text[a])) a++;
+  while (b > a && /\s/.test(text[b - 1])) b--;
+  if (a >= b) return null;
+  const loc = (off, isEnd) => {
+    for (const s of segs) {
+      const len = s.node.data.length;
+      if (isEnd ? (off > s.start && off <= s.start + len) : (off >= s.start && off < s.start + len)) return [s.node, off - s.start];
+    }
+    const l = segs[segs.length - 1]; return [l.node, l.node.data.length];
+  };
+  const r = doc.createRange(), st = loc(a, false), en = loc(b, true);
+  r.setStart(st[0], st[1]); r.setEnd(en[0], en[1]);
+  return r;
+}
+function clearHighlight(contents) {
+  try { if (contents.window.CSS && contents.window.CSS.highlights) contents.window.CSS.highlights.delete('sentence-hl'); } catch {}
+  if (state.hlCfi && state.rendition) { try { state.rendition.annotations.remove(state.hlCfi, 'highlight'); } catch {} }
+  state.hlCfi = null; contents.__hlRange = null;
+}
+function clearFallbackHighlight() {
+  if (state.hlCfi && state.rendition) { try { state.rendition.annotations.remove(state.hlCfi, 'highlight'); } catch {} }
+  state.hlCfi = null;
+}
+function clearAllHighlights() { if (state.rendition) state.rendition.getContents().forEach(clearHighlight); }
+function setHighlight(contents, range) {
+  const win = contents.window;
+  clearHighlight(contents);
+  contents.__hlRange = range;
+  if (win.CSS && win.CSS.highlights && win.Highlight) {
+    win.CSS.highlights.set('sentence-hl', new win.Highlight(range));
+  } else if (state.rendition) {
+    try {
+      const dark = resolvedTheme() === 'dark';
+      const cfi = contents.cfiFromRange(range);
+      state.rendition.annotations.highlight(cfi, {}, null, 'sentence-hl-mark',
+        { fill: dark ? '#ffd60a' : '#ffcc00', 'fill-opacity': dark ? '0.32' : '0.45', 'pointer-events': 'none' });
+      state.hlCfi = cfi;
+    } catch (e) { console.warn('highlight failed', e); }
+  }
+}
+function wireHighlight(contents) {
+  const doc = contents.document, win = contents.window;
+  doc.addEventListener('click', (e) => {
+    if (state.settings.hl === 'off' || e.defaultPrevented) return;
+    if (e.target.closest && e.target.closest('a[href],button,input,select,textarea,summary')) return;
+    const sel = win.getSelection();
+    if (sel && !sel.isCollapsed && String(sel).trim()) return;
+    try {
+      const c = caretAt(doc, e.clientX, e.clientY);
+      if (!c || !c.node || c.node.nodeType !== 3 || !hitsText(doc, c.node, c.offset, e.clientX, e.clientY)) { clearHighlight(contents); return; }
+      const range = sentenceRange(contents, c.node, c.offset);
+      if (!range) { clearHighlight(contents); return; }
+      const cur = contents.__hlRange;
+      if (cur && cur.compareBoundaryPoints(win.Range.START_TO_START, range) === 0 && cur.compareBoundaryPoints(win.Range.END_TO_END, range) === 0) { clearHighlight(contents); return; }
+      setHighlight(contents, range);
+    } catch (err) { console.warn('sentence highlight failed', err); }
+  });
+}
+
 function applySettings() {
   document.documentElement.dataset.resolved = resolvedTheme();
   if (state.rendition) {
+    if (state.hlCfi) clearAllHighlights();
     state.rendition.getContents().forEach(c => { injectStyles(c); try { c.resizeCheck && c.resizeCheck(); } catch {} });
   }
 }
@@ -364,6 +496,7 @@ mq.addEventListener('change', () => { if (state.settings.theme === 'auto') { app
 function setSetting(key, val) {
   state.settings[key] = val;
   lsSet('epubreader.settings', JSON.stringify(state.settings));
+  if (key === 'hl' && val === 'off') clearAllHighlights();
   applySettings(); refreshPopover();
 }
 
@@ -535,7 +668,7 @@ function teardown() {
   try { if (state.rendition) state.rendition.destroy(); } catch {}
   try { if (state.book) state.book.destroy(); } catch {}
   state.rendition = null; state.book = null; state.toc = []; state.rowEls = [];
-  state.lastIdx = -1; state.curIdx = -1; state.visited = new Set();
+  state.lastIdx = -1; state.curIdx = -1; state.visited = new Set(); state.curFile = null; state.hlCfi = null;
   $('#viewer').textContent = '';
 }
 function findSpine(href) {
@@ -628,7 +761,7 @@ function ensureRendition() {
   if (state.rendition) return state.rendition;
   const token = state.token;
   const r = state.book.renderTo($('#viewer'), { width: '100%', height: '100%', flow: 'scrolled-doc', spread: 'none', allowScriptedContent: false });
-  r.hooks.content.register((contents) => { injectStyles(contents); wireLinks(contents); });
+  r.hooks.content.register((contents) => { injectStyles(contents); wireLinks(contents); wireHighlight(contents); });
   r.on('relocated', (loc) => { if (token === state.token) onRelocated(loc); });
   r.on('keyup', onKey);
   state.rendition = r;
@@ -651,6 +784,8 @@ async function showTarget(target, quiet) {
 
 function onRelocated(loc) {
   const file = loc.start.href;
+  if (state.curFile && state.curFile !== file) clearFallbackHighlight();
+  state.curFile = file;
   const t = state.toc[state.lastIdx];
   state.curIdx = (t && t.file === file) ? state.lastIdx : state.toc.findIndex(e => e.file === file);
   state.spineIndex = loc.start.index;
@@ -693,7 +828,7 @@ function onKey(e) {
   if (t && /^(input|textarea|select)$/i.test(t.tagName)) return;
   if (e.key === 'ArrowRight') next();
   else if (e.key === 'ArrowLeft') prev();
-  else if (e.key === 'Escape') closePopover();
+  else if (e.key === 'Escape') { closePopover(); clearAllHighlights(); }
 }
 
 /* ------------------------------------------------------------------ text options popover */
@@ -712,7 +847,8 @@ function buildPopover() {
   pop.append(
     sec('Font', fonts), sec('Text size', size),
     sec('Line spacing', seg('spacing', [['compact', 'Compact'], ['normal', 'Normal'], ['relaxed', 'Relaxed']])),
-    sec('Appearance', seg('theme', [['auto', 'Auto'], ['light', 'Light'], ['dark', 'Dark']])));
+    sec('Appearance', seg('theme', [['auto', 'Auto'], ['light', 'Light'], ['dark', 'Dark']])),
+    sec('Highlight sentence on tap', seg('hl', [['on', 'On'], ['off', 'Off']])));
   refreshPopover();
 }
 function refreshPopover() {
