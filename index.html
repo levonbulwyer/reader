@@ -156,6 +156,19 @@ button{font:inherit;color:inherit}
 .seg button.on{background:var(--card);box-shadow:0 0 0 .5px var(--line),0 1px 3px rgba(0,0,0,.15);font-weight:600}
 :root[data-resolved="dark"] .seg button.on{background:#636366;color:#fff}
 
+/* ---------- Selection menu (look up / ask Google) ---------- */
+.ctx{position:fixed;z-index:70;width:max-content;min-width:210px;max-width:min(340px,calc(100vw - 16px));padding:5px;background:var(--card);color:var(--fg);border-radius:10px;box-shadow:var(--pop-shadow);font-size:13px}
+.ctx-item{appearance:none;border:0;background:none;display:block;width:100%;text-align:left;padding:7px 10px;border-radius:6px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ctx-item:hover{background:var(--accent);color:#fff}
+.ctx-sep{height:1px;background:var(--line);margin:4px 6px}
+.ctx-def{padding:8px 10px 6px;max-height:min(280px,50vh);overflow:auto;line-height:1.4;font-size:13px;white-space:normal}
+.ctx-def .w{font-weight:700;font-size:15px}
+.ctx-def .ph{color:var(--fg2);margin-left:6px}
+.ctx-def .pos{display:block;margin-top:8px;color:var(--fg2);font-style:italic;font-size:12px}
+.ctx-def .d{margin-top:2px}
+.ctx-def .msg{color:var(--fg2)}
+.ctx-def .ex{color:var(--fg2);font-style:italic}
+
 /* ---------- Drop overlay & toast ---------- */
 .drop{position:fixed;inset:10px;border:2px dashed var(--accent);border-radius:16px;background:rgba(10,122,255,.1);display:none;place-content:center;font-size:18px;font-weight:600;color:var(--accent);z-index:50;pointer-events:none;text-align:center}
 .drop.on{display:grid}
@@ -244,6 +257,7 @@ button{font:inherit;color:inherit}
 </div>
 
 <input type="file" id="file" accept=".epub,application/epub+zip" multiple hidden>
+<div class="ctx" id="ctx" hidden></div>
 <div class="drop" id="drop">Drop an EPUB to add it to your library</div>
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
@@ -328,7 +342,9 @@ function readerCss() {
 html{background:${bg} !important;color-scheme:${dark ? 'dark' : 'light'}}
 body{background:${bg} !important;color:${fg} !important;font-size:${s.size}% !important;line-height:${lh} !important;max-width:46em;margin:0 auto !important;padding:20px 32px 56px !important;box-sizing:border-box;overflow-wrap:break-word;-webkit-text-size-adjust:100%}
 p,li,dd,dt,blockquote,td,th{font-size:1em !important;line-height:${lh} !important}
-a,a:visited{color:${link} !important}
+a[href],a[href]:visited{color:${link} !important}
+a:not([href]){color:inherit !important;text-decoration:none !important}
+body *:not(a[href]):not(a[href] *):not(img):not(svg):not(svg *){color:inherit !important}
 img,video{max-width:100% !important;height:auto !important}
 ::selection{background:rgba(10,122,255,.3)}
 ::highlight(sentence-hl){background-color:${dark ? 'rgba(255,214,10,.32)' : 'rgba(255,204,0,.45)'}}
@@ -481,6 +497,181 @@ function wireHighlight(contents) {
       if (cur && cur.compareBoundaryPoints(win.Range.START_TO_START, range) === 0 && cur.compareBoundaryPoints(win.Range.END_TO_END, range) === 0) { clearHighlight(contents); return; }
       setHighlight(contents, range);
     } catch (err) { console.warn('sentence highlight failed', err); }
+  });
+}
+
+/* ------------------------------------------------------------------ look up / ask Google on a selection */
+const ctxEl = $('#ctx');
+const WORDCH = /[\p{L}\p{M}\p{N}'’-]/u;
+const hideCtx = () => { ctxEl.hidden = true; ctxEl.textContent = ''; };
+const googleUrl = (q) => 'https://www.google.com/search?q=' + encodeURIComponent(q);
+const openExternal = (url) => window.open(url, '_blank', 'noopener');
+const ctxItem = (label, fn) => h('button', { class: 'ctx-item', onclick: (e) => { e.stopPropagation(); fn(); } }, label);
+const clip = (s, n) => s.length > n ? s.slice(0, n - 1) + '…' : s;
+
+function placeCtx(x, y) {
+  ctxEl.hidden = false;
+  const r = ctxEl.getBoundingClientRect(), m = 8;
+  ctxEl.style.left = Math.max(m, Math.min(x, innerWidth - r.width - m)) + 'px';
+  ctxEl.style.top = Math.max(m, Math.min(y, innerHeight - r.height - m)) + 'px';
+}
+function showCtx(text, x, y) {
+  const clean = text.replace(/\s+/g, ' ').trim();
+  if (!clean || clean.length > 300) return;
+  const word = clean.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, '');
+  const isWord = word && !/\s/.test(word) && word.length <= 45;
+  ctxEl.textContent = '';
+  if (isWord) ctxEl.append(ctxItem('Look up “' + clip(word, 28) + '”', () => defineWord(word, x, y)));
+  ctxEl.append(
+    ctxItem('Ask Google about “' + clip(clean, 28) + '”', () => { hideCtx(); openExternal(googleUrl(clean)); }),
+    h('div', { class: 'ctx-sep' }),
+    ctxItem('Copy', () => { hideCtx(); try { navigator.clipboard.writeText(clean); toast('Copied.'); } catch {} }));
+  placeCtx(x, y);
+}
+/* ---- built-in dictionary: WordNet 3.0 (primary) + Webster's 1913 (older words), one JSON shard per first letter ---- */
+const DICT_BASE = new URL('./dict/', document.baseURI).href;
+const dictShards = new Map();
+const shardKey = (w) => /^[a-z]/.test(w) ? w[0] : '_';
+function loadShard(k) {
+  if (!dictShards.has(k)) {
+    dictShards.set(k, fetch(DICT_BASE + k + '.json').then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+      .catch(e => { dictShards.delete(k); throw e; }));
+  }
+  return dictShards.get(k);
+}
+async function dictGet(w) {
+  const s = await loadShard(shardKey(w));
+  return Object.prototype.hasOwnProperty.call(s, w) ? s[w] : null;
+}
+const IRREG = {};
+`go:went,gone,goes|see:saw,seen|do:did,done,does|be:am,is,are,was,were,been,being|have:had,has,having|say:said|make:made|take:took,taken|come:came|know:knew,known|get:got,gotten|give:gave,given|find:found|think:thought|tell:told|become:became|leave:left|feel:felt|bring:brought|begin:began,begun|keep:kept|hold:held|write:wrote,written|stand:stood|hear:heard|let:let|mean:meant|set:set|meet:met|run:ran|pay:paid|sit:sat|speak:spoke,spoken|lie:lay,lain|lead:led|read:read|grow:grew,grown|lose:lost|fall:fell,fallen|send:sent|build:built|understand:understood|draw:drew,drawn|break:broke,broken|spend:spent|cut:cut|rise:rose,risen|drive:drove,driven|buy:bought|wear:wore,worn|choose:chose,chosen|seek:sought|throw:threw,thrown|catch:caught|deal:dealt|win:won|forget:forgot,forgotten|lay:laid|sell:sold|fight:fought|bear:bore,borne,born|teach:taught|eat:ate,eaten|sing:sang,sung|ring:rang,rung|swim:swam,swum|drink:drank,drunk|fly:flew,flown|steal:stole,stolen|shake:shook,shaken|hide:hid,hidden|bind:bound|bite:bit,bitten|blow:blew,blown|sleep:slept|sweep:swept|weep:wept|creep:crept|dream:dreamt|swear:swore,sworn|tear:tore,torn|awake:awoke,awoken|forgive:forgave,forgiven|forbid:forbade,forbidden|arise:arose,arisen|shine:shone|strike:struck|hang:hung|slide:slid|spring:sprang,sprung|sink:sank,sunk|stick:stuck|swing:swung|wind:wound|beat:beaten|ride:rode,ridden|shoot:shot|lend:lent|bend:bent|burn:burnt|learn:learnt|spell:spelt|spill:spilt|spoil:spoilt|dig:dug|feed:fed|flee:fled|bleed:bled|breed:bred|speed:sped|slay:slew,slain|smite:smote,smitten|thrive:throve|cleave:clove,cleft|abide:abode|beget:begot,begotten|behold:beheld|befall:befell|forsake:forsook,forsaken|foresee:foresaw,foreseen|overcome:overcame|undertake:undertook,undertaken|withdraw:withdrew,withdrawn|withstand:withstood|mistake:mistook,mistaken|upset:upset|broadcast:broadcast|cast:cast|cost:cost|hit:hit|hurt:hurt|put:put|quit:quit|shut:shut|split:split|spread:spread|burst:burst|bid:bade,bidden|man:men|woman:women|child:children|foot:feet|tooth:teeth|goose:geese|mouse:mice|louse:lice|ox:oxen|person:people|leaf:leaves|life:lives|wife:wives|knife:knives|wolf:wolves|half:halves|self:selves|shelf:shelves|thief:thieves|calf:calves|loaf:loaves|good:better,best|well:better,best|bad:worse,worst|ill:worse,worst|far:further,farther,furthest,farthest|little:less,least|many:more,most|much:more,most|old:elder,eldest|late:latter,last|nigh:nigher,nighest`.split('|').forEach(g => {
+  const [base, forms] = g.split(':');
+  forms.split(',').forEach(f => { (IRREG[f] = IRREG[f] || []).push(base); });
+});
+function ruleBases(w) {
+  const out = [], add = (b) => { if (b && b.length > 1 && b !== w && !out.includes(b)) out.push(b); };
+  const rules = [['ies', 'y'], ['ied', 'y'], ['ier', 'y'], ['iest', 'y'], ['ing', 'e'], ['ing', ''], ['ed', 'e'], ['ed', ''],
+    ['es', ''], ['s', ''], ['er', 'e'], ['er', ''], ['est', 'e'], ['est', ''], ['ly', ''], ['ves', 'f'], ['ves', 'fe'], ['men', 'man']];
+  for (const [suf, rep] of rules) {
+    if (!w.endsWith(suf) || w.length <= suf.length + 1) continue;
+    const stem = w.slice(0, -suf.length);
+    if (/([^aeiou])\1$/.test(stem) && /^(ing|ed|er|est)$/.test(suf)) add(stem.slice(0, -1));   // running → run
+    add(stem + rep);
+  }
+  return out;
+}
+const verbal = (d) => Array.isArray(d) && d.some(x => x[0] === 'v');
+const WEB_STUB = /^(imp\.|p\. ?p\.|p\. ?pr\.|pl\.|superl\.|compar\.|obs\. imp\.)/i;
+async function lookupWord(raw) {
+  const w = raw.toLowerCase().replace(/[’‘]/g, "'").replace(/'s$/, '').replace(/^'+|'+$/g, '');
+  if (!w) return [];
+  const found = [], seen = new Set([w]);
+  const direct = await dictGet(w);
+  if (direct) found.push({ word: w, data: direct, via: null });
+  for (const b of IRREG[w] || []) {
+    if (seen.has(b)) continue; seen.add(b);
+    const data = await dictGet(b);
+    if (data) found.push({ word: b, data, via: w });
+  }
+  if (!found.some(f => f.via)) {
+    for (const b of ruleBases(w)) {
+      if (seen.has(b)) continue; seen.add(b);
+      const data = await dictGet(b);
+      if (!data) continue;
+      // A word that has its own entry only gains a "form of" when the base is a real verb (running → run), never e.g. morning → morn.
+      if (direct && !(verbal(data) && /(s|ed|ing)$/.test(w))) continue;
+      found.push({ word: b, data, via: w }); break;
+    }
+  }
+  // Webster's "imp. of X" / "pl. of X" stubs are noise once the real entry is found.
+  return found.some(f => f.via) ? found.filter(f => f.via || !(typeof f.data === 'string' && WEB_STUB.test(f.data))) : found;
+}
+const POS_NAME = { n: 'noun', v: 'verb', a: 'adjective', r: 'adverb' };
+async function defineWord(word, x, y) {
+  const box = h('div', { class: 'ctx-def' }, h('span', { class: 'msg', text: 'Looking up “' + word + '”…' }));
+  ctxEl.textContent = ''; ctxEl.append(box); placeCtx(x, y);
+  const googleItem = (label) => ctxItem(label, () => { hideCtx(); openExternal(googleUrl(label.startsWith('Define') ? 'define ' + word : word)); });
+  let results;
+  try { results = await lookupWord(word); }
+  catch (e) {
+    console.warn('dictionary load failed', e);
+    box.textContent = ''; box.append(h('div', { class: 'msg', text: 'Couldn’t load the dictionary.' }));
+    ctxEl.append(h('div', { class: 'ctx-sep' }), googleItem('Define “' + clip(word, 24) + '” on Google'));
+    placeCtx(x, y); return;
+  }
+  box.textContent = '';
+  if (!results.length) {
+    box.append(h('div', { class: 'msg', text: 'No entry for “' + word + '”.' }));
+    ctxEl.append(h('div', { class: 'ctx-sep' }), googleItem('Define “' + clip(word, 24) + '” on Google'));
+    placeCtx(x, y); return;
+  }
+  for (const r of results) {
+    if (r.via) box.append(h('div', { class: 'msg', text: '“' + r.via + '” is a form of:' }));
+    box.append(h('div', {}, h('span', { class: 'w', text: r.word })));
+    if (typeof r.data === 'string') {
+      box.append(h('span', { class: 'pos', text: 'Webster’s 1913' }), h('div', { class: 'd', text: r.data }));
+    } else {
+      const byPos = new Map();
+      for (const [p, d, ex] of r.data) { if (!byPos.has(p)) byPos.set(p, []); byPos.get(p).push([d, ex]); }
+      const groups = [...byPos];
+      if (r.via && verbal(r.data) && (/(ed|ing)$/.test(r.via) || IRREG[r.via])) groups.sort((a, b) => (b[0] === 'v') - (a[0] === 'v'));
+      for (const [p, list] of groups) {
+        box.append(h('span', { class: 'pos', text: POS_NAME[p] || p }));
+        list.slice(0, 3).forEach(([d, ex], i) => {
+          box.append(h('div', { class: 'd', text: (list.length > 1 ? (i + 1) + '. ' : '') + d }));
+          if (i === 0 && ex) box.append(h('div', { class: 'd ex', text: '“' + ex + '”' }));
+        });
+      }
+    }
+  }
+  ctxEl.append(h('div', { class: 'ctx-sep' }), googleItem('Ask Google about “' + clip(word, 24) + '”'));
+  placeCtx(x, y);
+}
+function wordRangeAt(doc, node, offset) {
+  const t = node.data; let a = offset, b = offset;
+  while (a > 0 && WORDCH.test(t[a - 1])) a--;
+  while (b < t.length && WORDCH.test(t[b])) b++;
+  while (a < b && /^['’-]/.test(t[a])) a++;
+  while (b > a && /['’-]$/.test(t[b - 1])) b--;
+  if (a >= b) return null;
+  const r = doc.createRange(); r.setStart(node, a); r.setEnd(node, b);
+  return r;
+}
+function wireLookup(contents) {
+  const doc = contents.document, win = contents.window;
+  const frame = () => { try { return win.frameElement.getBoundingClientRect(); } catch { return { left: 0, top: 0 }; } };
+  doc.addEventListener('contextmenu', (e) => {
+    if (e.target.closest && e.target.closest('a[href],input,textarea,select')) return;
+    let sel = win.getSelection(), text = sel && !sel.isCollapsed ? String(sel) : '';
+    if (!text.trim()) {
+      const c = caretAt(doc, e.clientX, e.clientY);
+      if (!c || !c.node || c.node.nodeType !== 3 || !hitsText(doc, c.node, c.offset, e.clientX, e.clientY)) return;
+      const r = wordRangeAt(doc, c.node, c.offset);
+      if (!r) return;
+      sel.removeAllRanges(); sel.addRange(r); text = String(r);
+    }
+    if (!text.trim()) return;
+    e.preventDefault();
+    const f = frame();
+    showCtx(text, f.left + e.clientX, f.top + e.clientY + 4);
+  });
+  doc.addEventListener('mousedown', hideCtx);
+  doc.addEventListener('scroll', hideCtx, true);
+  // Touch screens have no right-click: offer the same menu just under a settled selection.
+  let t;
+  doc.addEventListener('selectionchange', () => {
+    clearTimeout(t);
+    if (!matchMedia('(pointer:coarse)').matches) return;
+    const sel = win.getSelection();
+    if (!sel || sel.isCollapsed || !String(sel).trim()) { hideCtx(); return; }
+    t = setTimeout(() => {
+      try {
+        const s = win.getSelection();
+        if (!s || s.isCollapsed || !String(s).trim()) return;
+        const q = s.getRangeAt(0).getBoundingClientRect(), f = frame();
+        showCtx(String(s), f.left + Math.max(0, q.left), f.top + q.bottom + 10);
+      } catch {}
+    }, 450);
   });
 }
 
@@ -761,7 +952,7 @@ function ensureRendition() {
   if (state.rendition) return state.rendition;
   const token = state.token;
   const r = state.book.renderTo($('#viewer'), { width: '100%', height: '100%', flow: 'scrolled-doc', spread: 'none', allowScriptedContent: false });
-  r.hooks.content.register((contents) => { injectStyles(contents); wireLinks(contents); wireHighlight(contents); });
+  r.hooks.content.register((contents) => { injectStyles(contents); wireLinks(contents); wireHighlight(contents); wireLookup(contents); });
   r.on('relocated', (loc) => { if (token === state.token) onRelocated(loc); });
   r.on('keyup', onKey);
   state.rendition = r;
@@ -828,7 +1019,7 @@ function onKey(e) {
   if (t && /^(input|textarea|select)$/i.test(t.tagName)) return;
   if (e.key === 'ArrowRight') next();
   else if (e.key === 'ArrowLeft') prev();
-  else if (e.key === 'Escape') { closePopover(); clearAllHighlights(); }
+  else if (e.key === 'Escape') { closePopover(); hideCtx(); clearAllHighlights(); }
 }
 
 /* ------------------------------------------------------------------ text options popover */
@@ -874,7 +1065,7 @@ function wire() {
   $('#prev').onclick = prev; $('#next').onclick = next;
 
   $('#aaBtn').onclick = (e) => { e.stopPropagation(); $('#pop').hidden = !$('#pop').hidden; };
-  document.addEventListener('click', (e) => { if (!e.target.closest('.aa-wrap')) closePopover(); });
+  document.addEventListener('click', (e) => { if (!e.target.closest('.aa-wrap')) closePopover(); if (!e.target.closest('#ctx')) hideCtx(); });
   document.addEventListener('keyup', onKey);
 
   // drag & drop
